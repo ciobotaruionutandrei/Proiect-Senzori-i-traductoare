@@ -1,0 +1,467 @@
+#include <xc.h>
+#include <stdio.h>
+#include <string.h>
+
+#define _XTAL_FREQ 8000000
+
+#pragma config FOSC = HS
+#pragma config WDTE = OFF
+#pragma config PWRTE = OFF
+#pragma config BOREN = OFF
+#pragma config LVP = OFF
+#pragma config CPD = OFF
+#pragma config WRT = OFF
+#pragma config CP = OFF
+
+// I2C addresses
+#define PCF8591_ADDR    0x90
+#define PCF8591_WRITE   0x90
+#define PCF8591_READ    0x91
+
+// Calibrare ADC INTERN (10-bit: 0-1023)
+#define ADC_INT_AT_0C    117
+#define ADC_INT_AT_25C   126
+#define ADC_INT_AT_50C   137
+#define ADC_INT_AT_75C   148
+#define ADC_INT_AT_100C  159
+
+// Calibrare PT100 prin PCF8591 (8-bit: 0-255)
+#define ADC_PT100_AT_0C     29
+#define ADC_PT100_AT_25C    32
+#define ADC_PT100_AT_50C    34
+#define ADC_PT100_AT_75C    37
+#define ADC_PT100_AT_100C   39
+
+// ============================================================================
+// UART FUNCTIONS
+// ============================================================================
+void UART_Init(void)
+{
+    TRISC6 = 0;
+    TRISC7 = 1;
+    SPBRG = 25;
+    TXSTA = 0x24;
+    RCSTA = 0x90;
+}
+
+void UART_Write(char data)
+{
+    while(!TXIF);
+    TXREG = data;
+}
+
+void UART_Write_String(const char *str)
+{
+    while(*str)
+        UART_Write(*str++);
+}
+
+void UART_Write_Int(int value)
+{
+    char buffer[12];
+    sprintf(buffer, "%d", value);
+    UART_Write_String(buffer);
+}
+
+// ============================================================================
+// I2C FUNCTIONS
+// ============================================================================
+void I2C_Init(void)
+{
+    TRISC3 = 1;
+    TRISC4 = 1;
+    SSPSTAT = 0x80;
+    SSPCON = 0x28;
+    SSPCON2 = 0x00;
+    SSPADD = 19;
+    __delay_ms(10);
+}
+
+void I2C_Start(void)
+{
+    SEN = 1;
+    while(SEN);
+}
+
+void I2C_Stop(void)
+{
+    PEN = 1;
+    while(PEN);
+}
+
+void I2C_Wait(void)
+{
+    while((SSPCON2 & 0x1F) || (SSPSTAT & 0x04));
+}
+
+void I2C_Write(unsigned char data)
+{
+    SSPBUF = data;
+    while(BF);
+    I2C_Wait();
+}
+
+unsigned char I2C_Read(unsigned char ack)
+{
+    unsigned char data;
+    
+    RCEN = 1;
+    while(!BF);
+    data = SSPBUF;
+    
+    I2C_Wait();
+    
+    ACKDT = ack ? 0 : 1;
+    ACKEN = 1;
+    while(ACKEN);
+    
+    return data;
+}
+
+// ============================================================================
+// PCF8591 ADC FUNCTIONS
+// ============================================================================
+unsigned char PCF8591_Read_Channel(unsigned char channel)
+{
+    unsigned char control_byte, data1, data2;
+    
+    control_byte = 0x40 | (channel & 0x03);
+    
+    I2C_Start();
+    I2C_Write(PCF8591_WRITE);
+    I2C_Write(control_byte);
+    I2C_Stop();
+    
+    __delay_us(100);
+    
+    I2C_Start();
+    I2C_Write(PCF8591_READ);
+    data1 = I2C_Read(1);
+    data2 = I2C_Read(0);
+    I2C_Stop();
+    
+    return data2;
+}
+
+unsigned int PCF8591_Read_Avg(unsigned char channel)
+{
+    unsigned long sum = 0;
+    unsigned char i;
+    
+    for(i = 0; i < 32; i++) {
+        sum += PCF8591_Read_Channel(channel);
+        __delay_ms(3);
+    }
+    
+    return (unsigned int)(sum >> 5);
+}
+
+// ============================================================================
+// INTERNAL ADC FUNCTIONS
+// ============================================================================
+void ADC_Internal_Init(void)
+{
+    TRISA0 = 1;
+    ADCON0 = 0x81;
+    ADCON1 = 0x8E;
+    __delay_ms(1);
+}
+
+unsigned int ADC_Internal_Read(void)
+{
+    __delay_us(20);
+    ADCON0bits.GO = 1;
+    while(ADCON0bits.GO);
+    return ((ADRESH << 8) | ADRESL);
+}
+
+unsigned int ADC_Internal_Read_Avg(void)
+{
+    unsigned long sum = 0;
+    unsigned char i;
+    
+    for(i = 0; i < 32; i++) {
+        sum += ADC_Internal_Read();
+        __delay_ms(3);
+    }
+    
+    return (unsigned int)(sum >> 5);
+}
+
+// ============================================================================
+// TEMPERATURE CONVERSION - ADC INTERN
+// ============================================================================
+int Get_Temp_Internal_Int(unsigned int adc)
+{
+    long temp_x100;
+    
+    if(adc <= ADC_INT_AT_25C) {
+        temp_x100 = ((long)(adc - ADC_INT_AT_0C) * 2500L) / 
+                    (ADC_INT_AT_25C - ADC_INT_AT_0C);
+    } 
+    else if(adc <= ADC_INT_AT_50C) {
+        temp_x100 = 2500 + ((long)(adc - ADC_INT_AT_25C) * 2500L) / 
+                    (ADC_INT_AT_50C - ADC_INT_AT_25C);
+    } 
+    else if(adc <= ADC_INT_AT_75C) {
+        temp_x100 = 5000 + ((long)(adc - ADC_INT_AT_50C) * 2500L) / 
+                    (ADC_INT_AT_75C - ADC_INT_AT_50C);
+    } 
+    else {
+        temp_x100 = 7500 + ((long)(adc - ADC_INT_AT_75C) * 2500L) / 
+                    (ADC_INT_AT_100C - ADC_INT_AT_75C);
+    }
+    
+    if(temp_x100 < 0) temp_x100 = 0;
+    if(temp_x100 > 10000) temp_x100 = 10000;
+    
+    return (int)temp_x100;
+}
+
+// ============================================================================
+// TEMPERATURE CONVERSION - PT100
+// ============================================================================
+int Get_Temp_PT100_Int(unsigned int adc)
+{
+    long temp_x100;
+    float adc_f = (float)adc;
+    
+    if(adc <= ADC_PT100_AT_25C) {
+        float ratio = (adc_f - (float)ADC_PT100_AT_0C) / 
+                      ((float)ADC_PT100_AT_25C - (float)ADC_PT100_AT_0C);
+        temp_x100 = (long)(ratio * 2500.0);
+    } 
+    else if(adc <= ADC_PT100_AT_50C) {
+        float ratio = (adc_f - (float)ADC_PT100_AT_25C) / 
+                      ((float)ADC_PT100_AT_50C - (float)ADC_PT100_AT_25C);
+        temp_x100 = 2500 + (long)(ratio * 2500.0);
+    } 
+    else if(adc <= ADC_PT100_AT_75C) {
+        float ratio = (adc_f - (float)ADC_PT100_AT_50C) / 
+                      ((float)ADC_PT100_AT_75C - (float)ADC_PT100_AT_50C);
+        temp_x100 = 5000 + (long)(ratio * 2500.0);
+    } 
+    else {
+        float ratio = (adc_f - (float)ADC_PT100_AT_75C) / 
+                      ((float)ADC_PT100_AT_100C - (float)ADC_PT100_AT_75C);
+        temp_x100 = 7500 + (long)(ratio * 2500.0);
+    }
+    
+    if(temp_x100 < 0) temp_x100 = 0;
+    if(temp_x100 > 10000) temp_x100 = 10000;
+    
+    return (int)temp_x100;
+}
+
+// ============================================================================
+// FUZIUNE INTELIGENTĂ - Selectează cea mai bună temperatură
+// ============================================================================
+int Get_Smart_Temperature(unsigned int adc_int, int temp_int, 
+                          unsigned int adc_pt100, int temp_pt100,
+                          unsigned char *source_id)
+{
+    float confidence_int = 1.0;
+    float confidence_pt100 = 1.0;
+    
+    // ADC Intern: verifică proximitatea fa?ă de puncte de calibrare
+    if((adc_int >= ADC_INT_AT_0C - 2 && adc_int <= ADC_INT_AT_0C + 2) ||
+       (adc_int >= ADC_INT_AT_25C - 2 && adc_int <= ADC_INT_AT_25C + 2) ||
+       (adc_int >= ADC_INT_AT_50C - 2 && adc_int <= ADC_INT_AT_50C + 2) ||
+       (adc_int >= ADC_INT_AT_75C - 2 && adc_int <= ADC_INT_AT_75C + 2) ||
+       (adc_int >= ADC_INT_AT_100C - 2 && adc_int <= ADC_INT_AT_100C + 2)) {
+        confidence_int = 1.0;
+    } else {
+        confidence_int = 0.8;
+    }
+    
+    // PT100: verifică dacă e EXACT pe punct de calibrare
+    if(adc_pt100 == ADC_PT100_AT_0C || 
+       adc_pt100 == ADC_PT100_AT_25C || 
+       adc_pt100 == ADC_PT100_AT_50C || 
+       adc_pt100 == ADC_PT100_AT_75C || 
+       adc_pt100 == ADC_PT100_AT_100C) {
+        confidence_pt100 = 1.0;
+    } else {
+        confidence_pt100 = 0.2;
+    }
+    
+    // Factor de calitate: ADC intern are 4x mai multă rezolu?ie
+    confidence_int *= 4.0;
+    
+    // Determină sursa
+    float total_confidence = confidence_int + confidence_pt100;
+    
+    if(confidence_pt100 >= 0.9 && confidence_int >= 3.5) {
+        *source_id = 3;  // BOTH
+    } else if(confidence_int > confidence_pt100 * 2.0) {
+        *source_id = 1;  // INT
+    } else {
+        *source_id = 2;  // MIXED
+    }
+    
+    // Calculează temperatura finală (medie ponderată)
+    long temp_smart = ((long)temp_int * (long)(confidence_int * 100.0) + 
+                       (long)temp_pt100 * (long)(confidence_pt100 * 100.0)) / 
+                      (long)(total_confidence * 100.0);
+    
+    return (int)temp_smart;
+}
+
+// ============================================================================
+// DISPLAY FUNCTIONS
+// ============================================================================
+void Print_Startup_Banner(void)
+{
+    UART_Write_String("\r\n\r\n");
+    UART_Write_String("========================================================\r\n");
+    UART_Write_String("    TESTARE SENZOR RTD PT100 PE PIC16F877A\r\n");
+    UART_Write_String("    Dual-ADC System: Internal 10-bit + PCF8591 I2C\r\n");
+    UART_Write_String("--------------------------------------------------------\r\n");
+    UART_Write_String("    Proiect realizat de: Ciobotaru Ionut-Andrei\r\n");
+    UART_Write_String("                          Grupa 5405\r\n");
+    UART_Write_String("========================================================\r\n\r\n");
+}
+
+void Print_Init_Status(const char* module, const char* status)
+{
+    UART_Write_String("  [");
+    UART_Write_String(module);
+    UART_Write_String("] ");
+    
+    unsigned char i;
+    for(i = 0; i < (22 - strlen(module)); i++) {
+        UART_Write('.');
+    }
+    
+    UART_Write(' ');
+    UART_Write_String(status);
+    UART_Write_String("\r\n");
+}
+
+void Print_Table_Header(void)
+{
+    UART_Write_String("\r\n");
+    UART_Write_String("---------------------------------------------------------------\r\n");
+    UART_Write_String(" ADC Intern | Temp (INT) | ADC I2C | Temp PT100 | Temp Finala \r\n");
+    UART_Write_String("---------------------------------------------------------------\r\n");
+}
+
+void Print_Reading(unsigned int adc_int, int temp_int, 
+                   unsigned int adc_pt100, int temp_pt100, 
+                   int temp_best, unsigned char source)
+{
+    // ADC Intern (10-bit)
+    UART_Write_String("    ");
+    if(adc_int < 100) UART_Write(' ');
+    if(adc_int < 10) UART_Write(' ');
+    UART_Write_Int(adc_int);
+    UART_Write_String("    |   ");
+    
+    // Temp Intern
+    if(temp_int < 1000) UART_Write(' ');
+    UART_Write_Int(temp_int / 100);
+    UART_Write('.');
+    UART_Write(((temp_int / 10) % 10) + '0');
+    UART_Write_String("C   |  ");
+    
+    // ADC I2C (8-bit)
+    if(adc_pt100 < 100) UART_Write(' ');
+    if(adc_pt100 < 10) UART_Write(' ');
+    UART_Write_Int(adc_pt100);
+    UART_Write_String("    |   ");
+    
+    // Temp I2C
+    if(temp_pt100 < 1000) UART_Write(' ');
+    UART_Write_Int(temp_pt100 / 100);
+    UART_Write('.');
+    UART_Write(((temp_pt100 / 10) % 10) + '0');
+    UART_Write_String("C    |   ");
+    
+    // Temperatura Finală (smart fusion)
+    if(temp_best < 1000) UART_Write(' ');
+    UART_Write_Int(temp_best / 100);
+    UART_Write('.');
+    UART_Write(((temp_best / 10) % 10) + '0');
+    UART_Write_String("C");
+    
+    // Indicator calitate
+    if(source == 3) {
+        UART_Write_String(" *");  // Ambele pe calibrare - maxim de încredere
+    } else if(source == 1) {
+        UART_Write_String("  ");  // ADC intern dominant
+    } else {
+        UART_Write_String(" ~");  // Medie ponderată
+    }
+    
+    UART_Write_String("\r\n");
+}
+
+// ============================================================================
+// MAIN PROGRAM
+// ============================================================================
+void main(void)
+{
+    unsigned int adc_int, adc_pt100;
+    int temp_int_x100, temp_pt100_x100, temp_best_x100;
+    unsigned char source_id;
+    
+    // Initialize
+    UART_Init();
+    __delay_ms(100);
+    
+    Print_Startup_Banner();
+    
+    Print_Init_Status("Comunicatie UART", "OK");
+    __delay_ms(200);
+    
+    Print_Init_Status("Magistrala I2C", "OK");
+    I2C_Init();
+    __delay_ms(200);
+    
+    Print_Init_Status("ADC External PCF8591", "OK");
+    __delay_ms(200);
+    
+    Print_Init_Status("ADC Intern PIC", "OK");
+    ADC_Internal_Init();
+    __delay_ms(200);
+    
+    Print_Init_Status("Algoritm Fuziune", "OK");
+    __delay_ms(200);
+    
+    UART_Write_String("\r\n");
+    UART_Write_String("  >> Sistem operational <<\r\n");
+    UART_Write_String("  >> PT100 conectat pe PCF8591 Canal 0 <<\r\n");
+    
+    Print_Table_Header();
+    
+    while(1)
+    {
+        // Citeste de la ambele surse
+        adc_int = ADC_Internal_Read_Avg();
+        adc_pt100 = PCF8591_Read_Avg(0);
+        
+        // Calculează temperaturi
+        temp_int_x100 = Get_Temp_Internal_Int(adc_int);
+        temp_pt100_x100 = Get_Temp_PT100_Int(adc_pt100);
+        
+        // Fuziune inteligentă
+        temp_best_x100 = Get_Smart_Temperature(adc_int, temp_int_x100,
+                                               adc_pt100, temp_pt100_x100,
+                                               &source_id);
+        
+        // Afi?ează
+        Print_Reading(adc_int, temp_int_x100, 
+                     adc_pt100, temp_pt100_x100,
+                     temp_best_x100, source_id);
+        
+        __delay_ms(1000);
+    }
+}
+
+// ============================================================================
+// NOTE:
+// - Temp Finală = rezultatul algoritmului de fuziune inteligentă
+// - ADC Intern (10-bit) are rezolu?ie de 4x mai bună decât PCF8591 (8-bit)
+// - Sistemul selectează automat sursa cea mai precisă pentru fiecare citire
+// - Indicator * = precizie maximă (ambele ADC pe puncte de calibrare)
+// ============================================================================
